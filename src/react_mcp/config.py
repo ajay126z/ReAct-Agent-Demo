@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     transport: Literal["stdio", "http"] = "stdio"
     server_url: str = "http://127.0.0.1:8000/mcp"
 
+    # Web (OpenCode-style free fetch + search)
+    web_fetch_enabled: bool = True
+    web_fetch_timeout: float = Field(default=15.0, gt=0, le=60)
+    web_fetch_max_bytes: int = Field(default=500_000, ge=1000, le=5_000_000)
+    web_fetch_max_chars: int = Field(default=20_000, ge=500, le=100_000)
+    web_search_limit: int = Field(default=10, ge=1, le=20)
+    web_user_agent: str = "react-mcp/0.1 (+learning project)"
+
     # Paths
     workspace_dir: Path = DEFAULT_WORKSPACE
     notes_dir: Path = DEFAULT_NOTES
@@ -83,6 +91,12 @@ class Settings(BaseSettings):
             "REACT_MCP_LOG_LEVEL": self.log_level,
             "REACT_MCP_OTEL": self.otel,
             "REACT_MCP_OTLP_ENDPOINT": self.otlp_endpoint,
+            "REACT_MCP_WEB_FETCH_ENABLED": str(self.web_fetch_enabled).lower(),
+            "REACT_MCP_WEB_FETCH_TIMEOUT": str(self.web_fetch_timeout),
+            "REACT_MCP_WEB_FETCH_MAX_BYTES": str(self.web_fetch_max_bytes),
+            "REACT_MCP_WEB_FETCH_MAX_CHARS": str(self.web_fetch_max_chars),
+            "REACT_MCP_WEB_SEARCH_LIMIT": str(self.web_search_limit),
+            "REACT_MCP_WEB_USER_AGENT": self.web_user_agent,
         }
 
     def redacted(self) -> dict[str, object]:

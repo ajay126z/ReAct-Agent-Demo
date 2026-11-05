@@ -159,6 +159,8 @@ Tools:
 - `csv_preview` / `sqlite_query` - read-only previews of workspace data files.
 - `search_notes` / `read_note` - search and read `data/notes/*.md`.
 - `list_files` / `read_file` / `write_file` - sandboxed to `data/workspace`.
+- `web_fetch` - fetch a public http(s) URL and return markdown (HTML) or text, SSRF-guarded (free, no API key).
+- `web_search` - search the web via Bing HTML (free, no API key) and return titles, URLs, snippets.
 
 Resources: `notes://index`, `notes://{name}`, `config://agent`,
 `workspace://index`, and `workspace://file/{+path}`.
@@ -191,6 +193,11 @@ uv run react-mcp call write_file --auto-approve-writes \
 
 # Ask the agent to write a file; approve at the prompt
 uv run react-mcp ask "Write hello.txt with a short greeting."
+
+# Web tools (free, same shape as OpenCode's webfetch/websearch)
+uv run react-mcp call web_fetch --args '{"url":"https://example.com"}'
+uv run react-mcp call web_search --args '{"query":"Python 3.12 whatsnew","limit":3}'
+uv run react-mcp ask "Search the web for Python 3.12 whatsnew and fetch the top result."
 ```
 
 `SDKMCPClient` also exposes `complete_prompt()`, `complete_resource()`, and
@@ -241,6 +248,11 @@ from `.env` when present. CLI flags override them.
 | `REACT_MCP_REQUIRE_WRITE_APPROVAL` | `true` | Require MCP elicitation before `write_file`. |
 | `REACT_MCP_TRANSPORT` | `stdio` | `stdio` or `http`. |
 | `REACT_MCP_SERVER_URL` | `http://127.0.0.1:8000/mcp` | HTTP endpoint. |
+| `REACT_MCP_WEB_FETCH_ENABLED` | `true` | Enable `web_fetch` / `web_search`. |
+| `REACT_MCP_WEB_FETCH_TIMEOUT` | `15` | Per-request web timeout (seconds). |
+| `REACT_MCP_WEB_FETCH_MAX_BYTES` | `500000` | Max bytes read per web response. |
+| `REACT_MCP_WEB_FETCH_MAX_CHARS` | `20000` | Max chars returned by `web_fetch`. |
+| `REACT_MCP_WEB_SEARCH_LIMIT` | `10` | Default cap for `web_search` limit. |
 | `REACT_MCP_SESSION_DIR` | `./data/sessions` | Saved REPL session directory. |
 | `REACT_MCP_TRACE_DIR` | `./traces` | Trace output directory. |
 | `REACT_MCP_LOG_LEVEL` | `INFO` | Log verbosity. |
@@ -349,7 +361,11 @@ This is a learning project, not a hardened service. Tool arguments are treated
 as untrusted: arithmetic is AST-whitelisted, file paths are resolved and checked
 against the workspace root, and writes are size-limited. The HTTP transport has
 no authentication and binds to loopback by default; do not expose it publicly
-without adding auth and TLS.
+without adding auth and TLS. `web_fetch` / `web_search` only allow public
+http(s) URLs (private/loopback/link-local IPs are blocked, including after
+redirects), cap timeouts and sizes, and treat fetched content as untrusted
+prompt-injection-risk data. Set `REACT_MCP_WEB_FETCH_ENABLED=false` to turn
+them off entirely.
 
 See [docs/mcp-protocol.md](docs/mcp-protocol.md) for the protocol details and
 [data/notes/](data/notes/) for the notes the agent can search.

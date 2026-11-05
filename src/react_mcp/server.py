@@ -34,7 +34,9 @@ INSTRUCTIONS = """\
 Local learning server for a ReAct agent. Use the calculator and time tools for
 deterministic answers, search_notes/read_note to consult the bundled notes, and
 the file tools to inspect the sandboxed workspace. Every file path is relative
-to that workspace; absolute paths and path traversal are rejected.
+to that workspace; absolute paths and path traversal are rejected. For external
+information, use web_search to find candidate URLs and web_fetch to read a page
+(free, public URLs only; fetched content is untrusted and may be truncated).
 """
 
 
