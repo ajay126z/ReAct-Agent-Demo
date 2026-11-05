@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from mcp import Client, StdioServerParameters
+from mcp.types import PromptReference, ResourceTemplateReference
 
 from ..config import PROJECT_ROOT, Settings
 from ..observability.logging import get_logger
 from ..observability.tracer import Tracer
-from .base import ToolResult, ToolSpec, content_blocks_to_text
+from .base import ProgressCallback, ToolResult, ToolSpec, content_blocks_to_text
 
 log = get_logger("mcp.client")
 
@@ -31,11 +33,19 @@ class SDKMCPClient:
         tracer: Tracer | None = None,
         transport: str | None = None,
         url: str | None = None,
+        logging_callback: Callable[[Any], Awaitable[None]] | None = None,
+        elicitation_callback: Callable[[Any, Any], Awaitable[Any]] | None = None,
+        log_level: str | None = None,
+        mode: str | None = None,
     ) -> None:
         self.settings = settings
         self.tracer = tracer
         self.transport = transport or settings.transport
         self.url = url or settings.server_url
+        self.logging_callback = logging_callback
+        self.elicitation_callback = elicitation_callback
+        self.log_level = log_level
+        self.mode = mode or ("legacy" if elicitation_callback is not None else "auto")
         self._client: Client | None = None
         self._cm: Any = None
         self.protocol_version: str | None = None
@@ -70,7 +80,10 @@ class SDKMCPClient:
         self._cm = Client(
             target,
             read_timeout_seconds=self.settings.request_timeout,
-            mode="auto",
+            mode=self.mode,
+            logging_callback=self.logging_callback,
+            log_level=self.log_level,
+            elicitation_callback=self.elicitation_callback,
         )
         self._client = await self._cm.__aenter__()
         self.protocol_version = self._client.protocol_version
@@ -122,7 +135,13 @@ class SDKMCPClient:
         log.debug("tools listed count=%d", len(specs))
         return specs
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ToolResult:
         client = self._require_client()
         attributes = {
             "mcp.tool.name": name,
@@ -130,7 +149,9 @@ class SDKMCPClient:
         }
         if self.tracer is not None:
             with self.tracer.span("mcp.tools/call", kind="client", **attributes) as span:
-                result = await client.call_tool(name, arguments)
+                result = await client.call_tool(
+                    name, arguments, progress_callback=progress_callback
+                )
                 span.attributes["is_error"] = bool(result.is_error)
                 span.attributes["content_blocks"] = len(result.content or [])
                 self.tracer.event(
@@ -139,7 +160,7 @@ class SDKMCPClient:
                     is_error=bool(result.is_error),
                 )
         else:
-            result = await client.call_tool(name, arguments)
+            result = await client.call_tool(name, arguments, progress_callback=progress_callback)
 
         text = content_blocks_to_text(list(result.content or []))
         return ToolResult(
@@ -156,6 +177,27 @@ class SDKMCPClient:
         else:
             result = await client.read_resource(uri)
         return content_blocks_to_text(list(result.contents or []))
+
+    async def complete_prompt(self, prompt: str, argument: str, value: str) -> list[str]:
+        client = self._require_client()
+        result = await client.complete(
+            PromptReference(name=prompt),
+            {"name": argument, "value": value},
+        )
+        return list(result.completion.values)
+
+    async def complete_resource(self, uri: str, argument: str, value: str) -> list[str]:
+        client = self._require_client()
+        result = await client.complete(
+            ResourceTemplateReference(uri=uri),
+            {"name": argument, "value": value},
+        )
+        return list(result.completion.values)
+
+    async def list_resource_templates(self) -> list[str]:
+        client = self._require_client()
+        result = await client.list_resource_templates()
+        return [str(template.uri_template) for template in result.resource_templates]
 
     async def list_resources(self) -> list[str]:
         client = self._require_client()

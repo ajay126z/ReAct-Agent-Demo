@@ -19,6 +19,14 @@ def test_server_env_carries_paths_and_observability(settings: Settings) -> None:
     assert env["REACT_MCP_NOTES_DIR"] == str(settings.notes_dir)
     assert env["REACT_MCP_LOG_LEVEL"] == "INFO"
     assert env["REACT_MCP_OTEL"] == "none"
+    assert env["REACT_MCP_REQUIRE_WRITE_APPROVAL"] == "true"
+
+
+def test_memory_defaults_and_session_dir(settings: Settings) -> None:
+    settings.ensure_dirs()
+    assert settings.memory_turns == 6
+    assert settings.memory_chars == 4000
+    assert settings.session_dir.is_dir()
 
 
 def test_redacted_dump_is_json_safe(settings: Settings) -> None:
@@ -43,3 +51,33 @@ def test_cli_parses_serve_http() -> None:
     assert args.command == "serve"
     assert args.http is True
     assert args.port == 9000
+
+
+def test_cli_parses_session_flags() -> None:
+    ask = build_parser().parse_args(["ask", "hello", "--session", "demo"])
+    assert ask.session == "demo"
+    assert ask.continue_session is False
+
+    repl = build_parser().parse_args(["repl", "--continue"])
+    assert repl.session is None
+    assert repl.continue_session is True
+
+
+def test_cli_parses_protocol_feature_flags() -> None:
+    args = build_parser().parse_args(
+        ["ask", "hello", "--progress", "--server-logs", "--auto-approve-writes"]
+    )
+    assert args.progress is True
+    assert args.server_logs is True
+    assert args.auto_approve_writes is True
+
+
+def test_cli_parses_session_management() -> None:
+    listed = build_parser().parse_args(["session", "list", "--quiet"])
+    assert listed.command == "session"
+    assert listed.session_command == "list"
+    assert listed.quiet is True
+
+    deleted = build_parser().parse_args(["session", "delete", "demo"])
+    assert deleted.session_command == "delete"
+    assert deleted.session_name == "demo"

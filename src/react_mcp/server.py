@@ -20,7 +20,13 @@ from . import __version__
 from .config import Settings
 from .observability.logging import get_logger, setup_logging
 from .observability.otel import configure_otel, shutdown_otel
-from .tools import Toolbox, register_prompts, register_resources, register_tools
+from .tools import (
+    Toolbox,
+    register_completions,
+    register_prompts,
+    register_resources,
+    register_tools,
+)
 
 log = get_logger("server")
 
@@ -47,6 +53,7 @@ def create_server(settings: Settings | None = None) -> MCPServer:
     register_tools(server, toolbox)
     register_resources(server, toolbox, settings)
     register_prompts(server)
+    register_completions(server, toolbox)
     return server
 
 

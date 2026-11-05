@@ -67,14 +67,25 @@ successful `initialize` result.
 ### 2. Newer discovery
 
 Recent MCP revisions added `server/discover`, which lets a client ask what the
-server supports before choosing an interaction mode. The official SDK client
-used here negotiates `2026-07-28` automatically; the raw client deliberately
-uses `initialize` with `2025-11-25` because most documentation and tooling still
-describe that handshake. The server accepts both eras, which is why the same
-subprocess works for `SDKMCPClient` and `RawMCPClient`.
+server supports before choosing an interaction mode. `SDKMCPClient` negotiates
+`2026-07-28` by default; the raw client deliberately uses `initialize` with
+`2025-11-25` because most documentation and tooling still describe that
+handshake. The server accepts both eras, which is why the same subprocess works
+for `SDKMCPClient` and `RawMCPClient`.
 
 The core rule is unchanged: both sides must agree on a protocol version, and the
 client must only use capabilities the server advertised.
+
+`SDKMCPClient` switches to the legacy handshake when it installs an elicitation
+callback. The modern protocol forbids server-initiated requests, so approval
+prompts cannot use `elicitation/create` on a `2026-07-28` connection. With
+`--auto-approve-writes` no callback is installed and the client stays modern.
+
+| CLI usage | Handshake | Reason |
+| --- | --- | --- |
+| `tools` | modern | Discovery only; no server-to-client requests. |
+| `ask`, `repl`, `call` with approval | legacy | Write approval needs `elicitation/create`. |
+| Any command with `--auto-approve-writes` | modern | No elicitation callback is installed. |
 
 ### 3. Discovery
 
@@ -112,10 +123,49 @@ Resources and prompts are discovered the same way:
 {"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}
 ```
 
+```json
+{"jsonrpc":"2.0","id":3,"result":{"resources":[
+  {"uri":"notes://index","name":"note-index","mimeType":"application/json"},
+  {"uri":"workspace://index","name":"workspace-index","mimeType":"application/json"}
+]}}
+```
+
+Fixed resources live at stable URIs. Templates describe families of URIs:
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"resources/templates/list","params":{}}
+```
+
+```json
+{"jsonrpc":"2.0","id":5,"result":{"resourceTemplates":[
+  {"uriTemplate":"notes://{name}","name":"note"},
+  {"uriTemplate":"workspace://file/{+path}","name":"workspace-file"}
+]}}
+```
+
+`{+path}` is a reserved-expansion variable, so it can match nested paths such as
+`workspace://file/reports/2026/summary.txt`.
+
+Argument completion uses a reference to the prompt or resource template:
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"completion/complete","params":{
+  "ref":{"type":"ref/resource","uri":"notes://{name}"},
+  "argument":{"name":"name","value":"al"}
+}}
+```
+
+```json
+{"jsonrpc":"2.0","id":6,"result":{"completion":{"values":["alpha"],"total":1,"hasMore":false}}}
+```
+
+Completions in this server cover note names, workspace paths, and the
+`research` prompt's `topic` argument.
+
 ### 4. Calling a tool
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
   "name":"calculator",
   "arguments":{"expression":"(17 * 3) + 9"}
 }}
@@ -124,7 +174,7 @@ Resources and prompts are discovered the same way:
 A successful result returns typed content blocks:
 
 ```json
-{"jsonrpc":"2.0","id":5,"result":{
+{"jsonrpc":"2.0","id":7,"result":{
   "content":[{"type":"text","text":"60"}],
   "structuredContent":{"result":"60"},
   "isError":false
@@ -138,32 +188,83 @@ domain error (division by zero, bad path); it is still a successful JSON-RPC
 response. This project formats `isError` results as
 `Error from tool '...': ...` so the model can recover.
 
+While a tool runs, the server can notify the client about progress:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/progress","params":{
+  "progressToken":"7","progress":0,"total":3,"message":"Opening scores.csv"
+}}
+```
+
+Logging is similar (`notifications/message`), but modern revisions make it a
+per-request opt-in and deprecate the standalone logging capability. This
+project emits logs only when the client asks with `--server-logs`:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/message","params":{
+  "level":"info",
+  "logger":"react_mcp.tools",
+  "data":{"event":"csv_preview.done","path":"scores.csv","rows":10}
+}}
+```
+
+Writes use an elicitation round trip. On a legacy connection the server sends
+`elicitation/create`:
+
+```json
+{"jsonrpc":"2.0","id":"srv-1","method":"elicitation/create","params":{
+  "message":"Allow writing 5 characters to 'hello.txt'?",
+  "requestedSchema":{
+    "type":"object",
+    "properties":{"approve":{"type":"boolean","description":"Set to true to allow writing the file."}},
+    "required":["approve"]
+  }
+}}
+```
+
+The host asks the user and replies:
+
+```json
+{"jsonrpc":"2.0","id":"srv-1","result":{"action":"accept","content":{"approve":true}}}
+```
+
+`action` can be `"accept"`, `"decline"`, or `"cancel"`. On decline or cancel,
+the server returns a tool error and does not write the file. The modern protocol
+has no server-initiated request channel, which is why approval runs on the
+legacy handshake.
+
 ### 5. Reading a resource
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"notes://index"}}
+{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"notes://index"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":6,"result":{"contents":[
+{"jsonrpc":"2.0","id":8,"result":{"contents":[
   {"uri":"notes://index","mimeType":"application/json","text":"[{\"name\":\"react\",...}]"}
 ]}
 ```
 
 Resources are identified by URI. A server can expose fixed URIs and URI
 templates such as `notes://{name}`; the client fills in the variable and reads
-the resulting URI.
+the resulting URI. Workspace files work the same way:
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{
+  "uri":"workspace://file/reports/summary.txt"
+}}
+```
 
 ### 6. Rendering a prompt
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{
+{"jsonrpc":"2.0","id":10,"method":"prompts/get","params":{
   "name":"explain_mcp","arguments":{}
 }}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":7,"result":{"messages":[
+{"jsonrpc":"2.0","id":10,"result":{"messages":[
   {"role":"user","content":{"type":"text","text":"Explain the MCP lifecycle..."}}
 ]}}
 ```
@@ -200,22 +301,62 @@ A server advertises only what it implements. This server advertises:
 - `tools` - `tools/list`, `tools/call`
 - `resources` - `resources/list`, `resources/read`, templates
 - `prompts` - `prompts/list`, `prompts/get`
+- `completions` - `completion/complete`
 - `logging` - `notifications/message` when the server emits logs
+- client capability `elicitation` - required for write approval; delivered over
+  the legacy handshake because modern connections have no server-to-client
+  request channel
 
-The agent depends only on `tools`. `SDKMCPClient.list_resources()` and
-`list_prompts()` are convenience methods for exploration; the ReAct loop never
-calls them automatically.
+The agent depends only on `tools`. `SDKMCPClient.list_resources()`,
+`list_resource_templates()`, `list_prompts()`, `complete_resource()`, and
+`complete_prompt()` are convenience methods for exploration; the ReAct loop
+never calls them automatically. Progress and logging callbacks are installed
+only when the corresponding CLI flags are used.
 
 ## Where this lives in the code
 
 | Concept | Implementation |
 | --- | --- |
 | Server construction and transport | `src/react_mcp/server.py` |
-| Tool/resource/prompt registration | `src/react_mcp/tools.py` |
-| Official-SDK client | `src/react_mcp/mcp_client/sdk_client.py` |
+| Tools, resources, prompts, completions | `src/react_mcp/tools.py` |
+| Official-SDK client and callbacks | `src/react_mcp/mcp_client/sdk_client.py` |
 | Raw JSON-RPC client and framing | `src/react_mcp/mcp_client/raw_client.py` |
 | Local span/protocol trace | `src/react_mcp/observability/tracer.py` |
-| Live frame printer | `src/react_mcp/observability/render.py` |
+| Live progress, logs, and frame printer | `src/react_mcp/observability/render.py` |
+| CLI flags and approval prompt | `src/react_mcp/cli.py` |
+
+## Trying the features
+
+```bash
+# List tools, resources, and prompts
+uv run react-mcp tools
+
+# Progress and logging from a tool call
+uv run react-mcp call csv_preview \
+  --args '{"path":"scores.csv"}' --progress --server-logs
+
+# Write approval: enter y at the prompt
+uv run react-mcp call write_file \
+  --args '{"path":"hello.txt","content":"hello"}'
+
+# Write without approval and keep the modern handshake
+uv run react-mcp call write_file --auto-approve-writes \
+  --args '{"path":"hello.txt","content":"hello"}'
+
+# Agent run with progress and logs enabled
+uv run react-mcp ask "Preview scores.csv and summarize it." \
+  --progress --server-logs
+```
+
+The completions and resource-template helpers are available on the Python
+client:
+
+```python
+async with SDKMCPClient(settings) as client:
+    print(await client.list_resource_templates())
+    print(await client.complete_resource("notes://{name}", "name", "al"))
+    print(await client.complete_prompt("research", "topic", "react"))
+```
 
 ## Debugging checklist
 

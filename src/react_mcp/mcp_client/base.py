@@ -7,8 +7,11 @@ the hand-rolled protocol client are interchangeable.
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+ProgressCallback = Callable[[float, float | None, str | None], Awaitable[None]]
 
 
 class MCPClientError(RuntimeError):
@@ -65,7 +68,13 @@ class MCPToolClient(Protocol):
 
     async def list_tools(self) -> list[ToolSpec]: ...
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult: ...
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ToolResult: ...
 
 
 def content_blocks_to_text(blocks: list[Any]) -> str:

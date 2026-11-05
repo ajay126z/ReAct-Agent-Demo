@@ -12,6 +12,7 @@ wheels/
 # Local configuration and traces
 .env
 traces/
+data/sessions/
 data/workspace/*
 !data/workspace/.gitkeep
 

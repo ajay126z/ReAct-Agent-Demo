@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from react_mcp.agent.llm import LLMResponse
+from react_mcp.agent.memory import ConversationTurn
 from react_mcp.agent.react import ReActAgent
 from react_mcp.mcp_client.base import ToolResult, ToolSpec
 
@@ -34,7 +35,13 @@ class FakeClient:
     async def list_tools(self) -> list[ToolSpec]:
         return self.tools
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_callback: Any = None,
+    ) -> ToolResult:
         self.calls.append((name, arguments))
         if name in self.results:
             return self.results[name]
@@ -62,6 +69,22 @@ def make_agent(settings, llm: FakeLLM, client: FakeClient) -> ReActAgent:
         settings=settings,
         show_steps=False,
     )
+
+
+async def test_agent_injects_prior_qa_history(settings) -> None:
+    llm = FakeLLM(["Final Answer: 6"])
+    client = FakeClient([calculator_tool()])
+    agent = make_agent(settings, llm, client)
+    history = [ConversationTurn.create("What is 2+2?", "4", model="test-model")]
+
+    result = await agent.run("And 3+3?", history=history)
+
+    assert result.answer == "6"
+    messages = llm.calls[0]
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "user", "content": "What is 2+2?"}
+    assert messages[2] == {"role": "assistant", "content": "Final Answer: 4"}
+    assert messages[3] == {"role": "user", "content": "And 3+3?"}
 
 
 async def test_agent_runs_action_then_final(settings) -> None:

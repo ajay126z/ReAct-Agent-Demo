@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "workspace"
 DEFAULT_NOTES = PROJECT_ROOT / "data" / "notes"
+DEFAULT_SESSIONS = PROJECT_ROOT / "data" / "sessions"
 DEFAULT_TRACES = PROJECT_ROOT / "traces"
 
 
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     max_steps: int = Field(default=8, ge=1, le=50)
     max_parse_retries: int = Field(default=2, ge=0, le=10)
     max_observation_chars: int = Field(default=2000, ge=100)
+    memory_turns: int = Field(default=6, ge=1, le=50)
+    memory_chars: int = Field(default=4000, ge=100, le=100_000)
+    require_write_approval: bool = True
 
     # MCP transport
     transport: Literal["stdio", "http"] = "stdio"
@@ -45,6 +49,7 @@ class Settings(BaseSettings):
     # Paths
     workspace_dir: Path = DEFAULT_WORKSPACE
     notes_dir: Path = DEFAULT_NOTES
+    session_dir: Path = DEFAULT_SESSIONS
     trace_dir: Path = DEFAULT_TRACES
 
     # Observability
@@ -52,15 +57,16 @@ class Settings(BaseSettings):
     otel: Literal["none", "console", "otlp"] = "none"
     otlp_endpoint: str = "http://localhost:4317"
 
-    @field_validator("workspace_dir", "notes_dir", "trace_dir")
+    @field_validator("workspace_dir", "notes_dir", "session_dir", "trace_dir")
     @classmethod
     def _resolve_path(cls, value: Path) -> Path:
         return value if value.is_absolute() else (Path.cwd() / value).resolve()
 
     def ensure_dirs(self) -> None:
-        """Create the directories the server and tracer write to."""
+        """Create the directories the server and CLI write to."""
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.notes_dir.mkdir(parents=True, exist_ok=True)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
 
     def server_env(self) -> dict[str, str]:
@@ -73,6 +79,7 @@ class Settings(BaseSettings):
             "REACT_MCP_WORKSPACE_DIR": str(self.workspace_dir),
             "REACT_MCP_NOTES_DIR": str(self.notes_dir),
             "REACT_MCP_TRACE_DIR": str(self.trace_dir),
+            "REACT_MCP_REQUIRE_WRITE_APPROVAL": str(self.require_write_approval).lower(),
             "REACT_MCP_LOG_LEVEL": self.log_level,
             "REACT_MCP_OTEL": self.otel,
             "REACT_MCP_OTLP_ENDPOINT": self.otlp_endpoint,

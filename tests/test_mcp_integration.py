@@ -15,7 +15,18 @@ async def test_sdk_client_lists_calls_and_reads(settings) -> None:
         assert client.server_name
         tools = await client.list_tools()
         names = {tool.name for tool in tools}
-        assert {"calculator", "search_notes", "read_note", "list_files"} <= names
+        assert {
+            "calculator",
+            "date_diff",
+            "add_days",
+            "unit_convert",
+            "text_stats",
+            "csv_preview",
+            "sqlite_query",
+            "search_notes",
+            "read_note",
+            "list_files",
+        } <= names
 
         calculator = next(tool for tool in tools if tool.name == "calculator")
         assert "expression" in calculator.properties

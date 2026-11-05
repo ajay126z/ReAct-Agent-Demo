@@ -7,20 +7,32 @@ arbitrary code execution, and all file access is confined to a workspace root.
 from __future__ import annotations
 
 import ast
+import asyncio
+import csv
 import functools
+import inspect
 import json
 import operator
 import re
+import sqlite3
 import time
-from datetime import datetime
+import warnings
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
-from pydantic import Field
+from mcp.shared.exceptions import MCPDeprecationWarning
+from mcp.types import (
+    Completion,
+    PromptReference,
+    ResourceTemplateReference,
+    ToolAnnotations,
+)
+from pydantic import BaseModel, Field
 
 from .config import Settings
 from .observability.logging import get_logger
@@ -31,6 +43,121 @@ MAX_EXPRESSION_CHARS = 256
 MAX_EXPONENT = 100
 MAX_ABS_RESULT = 1e100
 MAX_WRITE_CHARS = 100_000
+MAX_TEXT_CHARS = 100_000
+MAX_CSV_BYTES = 1_000_000
+MAX_CSV_ROWS = 100
+MAX_SQLITE_BYTES = 50_000_000
+MAX_SQLITE_ROWS = 200
+
+
+class WriteApproval(BaseModel):
+    approve: bool = Field(description="Set to true to allow writing the file.")
+
+
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_LENGTH_TO_METERS = {
+    "m": 1.0,
+    "km": 1000.0,
+    "cm": 0.01,
+    "mm": 0.001,
+    "mi": 1609.344,
+    "yd": 0.9144,
+    "ft": 0.3048,
+    "in": 0.0254,
+}
+_MASS_TO_KG = {
+    "kg": 1.0,
+    "g": 0.001,
+    "mg": 0.000001,
+    "lb": 0.45359237,
+    "oz": 0.028349523125,
+}
+_TEMPERATURE_UNITS = {"c", "f", "k"}
+_UNIT_ALIASES = {
+    "m": "m",
+    "meter": "m",
+    "meters": "m",
+    "metre": "m",
+    "metres": "m",
+    "km": "km",
+    "kilometer": "km",
+    "kilometers": "km",
+    "kilometre": "km",
+    "kilometres": "km",
+    "cm": "cm",
+    "centimeter": "cm",
+    "centimeters": "cm",
+    "centimetre": "cm",
+    "centimetres": "cm",
+    "mm": "mm",
+    "millimeter": "mm",
+    "millimeters": "mm",
+    "millimetre": "mm",
+    "millimetres": "mm",
+    "mi": "mi",
+    "mile": "mi",
+    "miles": "mi",
+    "yd": "yd",
+    "yard": "yd",
+    "yards": "yd",
+    "ft": "ft",
+    "foot": "ft",
+    "feet": "ft",
+    "in": "in",
+    "inch": "in",
+    "inches": "in",
+    "kg": "kg",
+    "kilogram": "kg",
+    "kilograms": "kg",
+    "g": "g",
+    "gram": "g",
+    "grams": "g",
+    "mg": "mg",
+    "milligram": "mg",
+    "milligrams": "mg",
+    "lb": "lb",
+    "lbs": "lb",
+    "pound": "lb",
+    "pounds": "lb",
+    "oz": "oz",
+    "ounce": "oz",
+    "ounces": "oz",
+    "c": "c",
+    "°c": "c",
+    "celsius": "c",
+    "centigrade": "c",
+    "f": "f",
+    "°f": "f",
+    "fahrenheit": "f",
+    "k": "k",
+    "kelvin": "k",
+}
+_DIFF_UNIT_FACTORS = {
+    "days": 86400.0,
+    "hours": 3600.0,
+    "minutes": 60.0,
+    "seconds": 1.0,
+}
+_DIFF_UNIT_ALIASES = {
+    "d": "days",
+    "day": "days",
+    "days": "days",
+    "h": "hours",
+    "hr": "hours",
+    "hrs": "hours",
+    "hour": "hours",
+    "hours": "hours",
+    "m": "minutes",
+    "min": "minutes",
+    "mins": "minutes",
+    "minute": "minutes",
+    "minutes": "minutes",
+    "s": "seconds",
+    "sec": "seconds",
+    "secs": "seconds",
+    "second": "seconds",
+    "seconds": "seconds",
+}
 
 _BIN_OPS = {
     ast.Add: operator.add,
@@ -50,30 +177,129 @@ def _summarize(value: Any, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _tidy_number(value: float) -> int | float:
+    if abs(value) < 1e-12:
+        return 0
+    if value.is_integer():
+        return int(value)
+    return float(f"{value:.12g}")
+
+
+def _parse_temporal(value: str, label: str) -> datetime:
+    text = value.strip()
+    if not text:
+        raise ToolError(f"{label} is empty.")
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ToolError(
+            f"{label} must be an ISO 8601 date or datetime, for example "
+            "2026-01-31 or 2026-01-31T12:30:00+00:00."
+        ) from exc
+
+
+def _normalize_unit(unit: str) -> str:
+    key = unit.strip().lower()
+    normalized = _UNIT_ALIASES.get(key)
+    if normalized is None:
+        allowed = ", ".join(sorted(set(_UNIT_ALIASES.values())))
+        raise ToolError(f"Unknown unit {unit!r}. Supported units: {allowed}.")
+    return normalized
+
+
+def _convert_units(value: float, source: str, target: str) -> float:
+    if source in _LENGTH_TO_METERS and target in _LENGTH_TO_METERS:
+        return value * _LENGTH_TO_METERS[source] / _LENGTH_TO_METERS[target]
+    if source in _MASS_TO_KG and target in _MASS_TO_KG:
+        return value * _MASS_TO_KG[source] / _MASS_TO_KG[target]
+    if source in _TEMPERATURE_UNITS and target in _TEMPERATURE_UNITS:
+        if source == "c":
+            celsius = value
+        elif source == "f":
+            celsius = (value - 32.0) * 5.0 / 9.0
+        else:
+            celsius = value - 273.15
+        if target == "c":
+            return celsius
+        if target == "f":
+            return celsius * 9.0 / 5.0 + 32.0
+        return celsius + 273.15
+    raise ToolError(f"Cannot convert {source!r} to {target!r}; they are different unit types.")
+
+
+def _sqlite_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, memoryview):
+        return value.tobytes().hex()
+    return value
+
+
+def _loggable_args(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in kwargs.items() if key not in {"ctx", "context"}}
+
+
+def _log_tool_error(name: str, started: float, exc: Exception) -> None:
+    duration = (time.perf_counter() - started) * 1000
+    log.warning(
+        "tool.error name=%s duration_ms=%.1f error=%s: %s",
+        name,
+        duration,
+        type(exc).__name__,
+        exc,
+    )
+
+
 def instrumented(fn):
-    """Log tool entry/exit on the server's stderr without changing its signature."""
+    """Log tool entry/exit without changing the wrapped function's signature."""
+
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter()
+            log.info(
+                "tool.start name=%s args=%s",
+                fn.__name__,
+                _summarize(_loggable_args(kwargs)),
+            )
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as exc:
+                _log_tool_error(fn.__name__, started, exc)
+                raise
+            duration = (time.perf_counter() - started) * 1000
+            log.info("tool.end name=%s duration_ms=%.1f", fn.__name__, duration)
+            return result
+
+        return async_wrapper
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         started = time.perf_counter()
-        log.info("tool.start name=%s args=%s", fn.__name__, _summarize(kwargs))
+        log.info(
+            "tool.start name=%s args=%s",
+            fn.__name__,
+            _summarize(_loggable_args(kwargs)),
+        )
         try:
             result = fn(*args, **kwargs)
         except Exception as exc:
-            duration = (time.perf_counter() - started) * 1000
-            log.warning(
-                "tool.error name=%s duration_ms=%.1f error=%s: %s",
-                fn.__name__,
-                duration,
-                type(exc).__name__,
-                exc,
-            )
+            _log_tool_error(fn.__name__, started, exc)
             raise
         duration = (time.perf_counter() - started) * 1000
         log.info("tool.end name=%s duration_ms=%.1f", fn.__name__, duration)
         return result
 
     return wrapper
+
+
+async def _server_log(ctx: Context, level: str, data: Any) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MCPDeprecationWarning)
+        await ctx.log(level, data, logger_name="react_mcp.tools")
 
 
 class Toolbox:
@@ -141,6 +367,136 @@ class Toolbox:
             ) from exc
         now = datetime.now(zone)
         return now.isoformat(timespec="seconds") + f" ({now.strftime('%A')})"
+
+    # -- dates and units --------------------------------------------------
+    def date_diff(self, start: str, end: str, unit: str) -> dict[str, Any]:
+        start_dt = _parse_temporal(start, "start")
+        end_dt = _parse_temporal(end, "end")
+        if (start_dt.tzinfo is None) != (end_dt.tzinfo is None):
+            raise ToolError("start and end must both include a timezone or both omit it.")
+        normalized_unit = _DIFF_UNIT_ALIASES.get(unit.strip().lower())
+        if normalized_unit is None:
+            raise ToolError("unit must be days, hours, minutes, or seconds.")
+        seconds = (end_dt - start_dt).total_seconds()
+        value = _tidy_number(seconds / _DIFF_UNIT_FACTORS[normalized_unit])
+        return {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "value": value,
+            "unit": normalized_unit,
+        }
+
+    def add_days(self, date: str, days: int) -> str:
+        parsed = _parse_temporal(date, "date")
+        result = parsed + timedelta(days=days)
+        if _DATE_ONLY_RE.match(date.strip()):
+            return result.date().isoformat()
+        return result.isoformat()
+
+    def unit_convert(self, value: float, from_unit: str, to_unit: str) -> dict[str, Any]:
+        source = _normalize_unit(from_unit)
+        target = _normalize_unit(to_unit)
+        converted = _convert_units(float(value), source, target)
+        return {
+            "value": _tidy_number(converted),
+            "unit": target,
+            "from": source,
+        }
+
+    def text_stats(self, text: str) -> dict[str, Any]:
+        if len(text) > MAX_TEXT_CHARS:
+            raise ToolError(f"Text is too long (max {MAX_TEXT_CHARS} characters).")
+        stripped = text.strip()
+        sentences = len(re.findall(r"[^.!?]+[.!?]+", stripped))
+        if stripped and not sentences:
+            sentences = 1
+        return {
+            "characters": len(text),
+            "characters_no_whitespace": len(re.sub(r"\s", "", text)),
+            "words": len(text.split()),
+            "lines": len(text.splitlines()),
+            "sentences": sentences,
+        }
+
+    # -- tabular data -----------------------------------------------------
+    def csv_preview(self, relative: str, rows: int) -> dict[str, Any]:
+        if rows < 1 or rows > MAX_CSV_ROWS:
+            raise ToolError(f"rows must be between 1 and {MAX_CSV_ROWS}.")
+        path = self._safe_path(relative, must_exist=True)
+        if not path.is_file():
+            raise ToolError(f"Not a file: {relative!r}")
+        if path.stat().st_size > MAX_CSV_BYTES:
+            raise ToolError(f"CSV is too large (max {MAX_CSV_BYTES} bytes).")
+
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            sample = handle.read(8192)
+            handle.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample) if sample else csv.excel
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.reader(handle, dialect)
+            try:
+                columns = next(reader)
+            except StopIteration:
+                columns = []
+                data: list[list[str]] = []
+                truncated = False
+            else:
+                data = []
+                truncated = False
+                for index, row in enumerate(reader):
+                    if index >= rows:
+                        truncated = True
+                        break
+                    data.append(row)
+
+        return {
+            "path": path.relative_to(self.settings.workspace_dir.resolve()).as_posix(),
+            "columns": columns,
+            "rows": data,
+            "truncated": truncated,
+        }
+
+    def sqlite_query(self, relative: str, sql: str, limit: int) -> dict[str, Any]:
+        if limit < 1 or limit > MAX_SQLITE_ROWS:
+            raise ToolError(f"limit must be between 1 and {MAX_SQLITE_ROWS}.")
+        statement = sql.strip()
+        if not statement:
+            raise ToolError("SQL query is empty.")
+        first_word = statement.split(None, 1)[0].lower()
+        if first_word not in {"select", "with"}:
+            raise ToolError("Only read-only SELECT or WITH queries are allowed.")
+
+        path = self._safe_path(relative, must_exist=True)
+        if not path.is_file():
+            raise ToolError(f"Not a file: {relative!r}")
+        if path.stat().st_size > MAX_SQLITE_BYTES:
+            raise ToolError(f"SQLite database is too large (max {MAX_SQLITE_BYTES} bytes).")
+
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+            connection.execute("PRAGMA query_only = ON")
+            cursor = connection.execute(statement)
+            if cursor.description is None:
+                raise ToolError("Query did not return rows.")
+            columns = [item[0] for item in cursor.description]
+            fetched = cursor.fetchmany(limit + 1)
+        except sqlite3.Error as exc:
+            raise ToolError(f"SQLite query failed: {exc}") from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+        truncated = len(fetched) > limit
+        rows = [[_sqlite_value(value) for value in row] for row in fetched[:limit]]
+        return {
+            "path": path.relative_to(self.settings.workspace_dir.resolve()).as_posix(),
+            "columns": columns,
+            "rows": rows,
+            "truncated": truncated,
+        }
 
     # -- notes ------------------------------------------------------------
     def note_files(self) -> list[Path]:
@@ -255,6 +611,9 @@ class Toolbox:
                 )
         return entries
 
+    def workspace_index(self) -> list[dict[str, Any]]:
+        return [entry for entry in self.list_files("") if entry["type"] == "file"]
+
     def read_file(self, relative: str, max_bytes: int) -> str:
         path = self._safe_path(relative, must_exist=True)
         if not path.is_file():
@@ -315,6 +674,140 @@ def register_tools(mcp: MCPServer, toolbox: Toolbox) -> None:
         return toolbox.current_time(timezone)
 
     @mcp.tool(
+        title="Date difference",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    def date_diff(
+        start: Annotated[
+            str,
+            Field(description="Start date or datetime in ISO 8601, e.g. 2026-01-01."),
+        ],
+        end: Annotated[
+            str,
+            Field(description="End date or datetime in ISO 8601, e.g. 2026-02-01."),
+        ],
+        unit: Annotated[
+            str,
+            Field(description="Difference unit: days, hours, minutes, or seconds."),
+        ] = "days",
+    ) -> dict[str, Any]:
+        """Return the difference between two ISO dates or datetimes."""
+        return toolbox.date_diff(start, end, unit)
+
+    @mcp.tool(
+        title="Add days",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    def add_days(
+        date: Annotated[
+            str,
+            Field(description="ISO 8601 date or datetime to shift, e.g. 2026-01-31."),
+        ],
+        days: Annotated[
+            int,
+            Field(
+                description="Number of days to add; negative values subtract.",
+                ge=-365000,
+                le=365000,
+            ),
+        ],
+    ) -> str:
+        """Add or subtract days from an ISO date or datetime."""
+        return toolbox.add_days(date, days)
+
+    @mcp.tool(
+        title="Convert units",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    def unit_convert(
+        value: Annotated[float, Field(description="Numeric value to convert.")],
+        from_unit: Annotated[
+            str,
+            Field(description="Source unit, e.g. m, km, kg, lb, C, F, or K."),
+        ],
+        to_unit: Annotated[
+            str,
+            Field(description="Target unit of the same type, e.g. ft, g, or C."),
+        ],
+    ) -> dict[str, Any]:
+        """Convert a value between length, mass, or temperature units."""
+        return toolbox.unit_convert(value, from_unit, to_unit)
+
+    @mcp.tool(
+        title="Text statistics",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    def text_stats(
+        text: Annotated[str, Field(description="Text to measure.")],
+    ) -> dict[str, Any]:
+        """Count characters, words, lines, and sentences in text."""
+        return toolbox.text_stats(text)
+
+    @mcp.tool(
+        title="Preview CSV",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    async def csv_preview(
+        path: Annotated[
+            str,
+            Field(description="CSV path relative to the workspace root."),
+        ],
+        ctx: Context,
+        rows: Annotated[
+            int,
+            Field(description="Maximum data rows to return.", ge=1, le=MAX_CSV_ROWS),
+        ] = 10,
+    ) -> dict[str, Any]:
+        """Preview a CSV file from the sandboxed workspace."""
+        await ctx.report_progress(0, total=3, message=f"Opening {path}")
+        await _server_log(ctx, "info", {"event": "csv_preview.start", "path": path})
+        result = await asyncio.to_thread(toolbox.csv_preview, path, rows)
+        await ctx.report_progress(3, total=3, message="CSV preview ready")
+        await _server_log(
+            ctx,
+            "info",
+            {"event": "csv_preview.done", "path": path, "rows": len(result["rows"])},
+        )
+        return result
+
+    @mcp.tool(
+        title="Query SQLite",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    async def sqlite_query(
+        path: Annotated[
+            str,
+            Field(description="SQLite database path relative to the workspace root."),
+        ],
+        sql: Annotated[
+            str,
+            Field(description="One read-only SELECT or WITH query."),
+        ],
+        ctx: Context,
+        limit: Annotated[
+            int,
+            Field(description="Maximum rows to return.", ge=1, le=MAX_SQLITE_ROWS),
+        ] = 50,
+    ) -> dict[str, Any]:
+        """Run a read-only query against a workspace SQLite database."""
+        await ctx.report_progress(0, total=3, message=f"Querying {path}")
+        await _server_log(ctx, "info", {"event": "sqlite_query.start", "path": path})
+        result = await asyncio.to_thread(toolbox.sqlite_query, path, sql, limit)
+        await ctx.report_progress(3, total=3, message="Query complete")
+        await _server_log(
+            ctx,
+            "info",
+            {"event": "sqlite_query.done", "path": path, "rows": len(result["rows"])},
+        )
+        return result
+
+    @mcp.tool(
         title="Search notes",
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
     )
@@ -370,12 +863,44 @@ def register_tools(mcp: MCPServer, toolbox: Toolbox) -> None:
         ),
     )
     @instrumented
-    def write_file(
+    async def write_file(
         path: Annotated[str, Field(description="File path relative to the workspace root.")],
         content: Annotated[str, Field(description="Full text content to write.")],
+        ctx: Context,
     ) -> str:
         """Write a UTF-8 text file inside the sandboxed workspace."""
-        return toolbox.write_file(path, content)
+        if toolbox.settings.require_write_approval:
+            capabilities = ctx.client_capabilities
+            if capabilities is None or getattr(capabilities, "elicitation", None) is None:
+                raise ToolError(
+                    "This server requires write approval, but the client did not advertise "
+                    "elicitation support. Re-run with --auto-approve-writes or set "
+                    "REACT_MCP_REQUIRE_WRITE_APPROVAL=false to skip approval."
+                )
+            await _server_log(
+                ctx,
+                "info",
+                {"event": "write.approval_requested", "path": path, "chars": len(content)},
+            )
+            approval = await ctx.elicit(
+                f"Allow writing {len(content)} characters to {path!r}?",
+                WriteApproval,
+            )
+            if approval.action == "decline":
+                raise ToolError("Write declined by user; no file was written.")
+            if approval.action == "cancel":
+                raise ToolError("Write cancelled by user; no file was written.")
+            if approval.data is None or not approval.data.approve:
+                raise ToolError("Write not approved; no file was written.")
+        await ctx.report_progress(0, total=2, message=f"Writing {path}")
+        result = await asyncio.to_thread(toolbox.write_file, path, content)
+        await ctx.report_progress(2, total=2, message="Write complete")
+        await _server_log(
+            ctx,
+            "info",
+            {"event": "write.completed", "path": path, "chars": len(content)},
+        )
+        return result
 
 
 def register_resources(mcp: MCPServer, toolbox: Toolbox, settings: Settings) -> None:
@@ -393,6 +918,51 @@ def register_resources(mcp: MCPServer, toolbox: Toolbox, settings: Settings) -> 
     def agent_config() -> str:
         """Current server configuration (paths, model defaults, observability)."""
         return json.dumps(settings.redacted(), indent=2)
+
+    @mcp.resource("workspace://index", name="workspace-index", mime_type="application/json")
+    def workspace_index() -> str:
+        """JSON index of every file in the sandboxed workspace."""
+        return json.dumps(toolbox.workspace_index(), indent=2)
+
+    @mcp.resource(
+        "workspace://file/{+path}",
+        name="workspace-file",
+        mime_type="text/plain",
+    )
+    def workspace_file(path: str) -> str:
+        """Read a workspace file by its relative path."""
+        return toolbox.read_file(path, 20_000)
+
+
+def _complete(values: list[str], prefix: str, limit: int = 50) -> Completion:
+    lowered = prefix.lower()
+    matches = [value for value in values if lowered in value.lower()]
+    return Completion(
+        values=matches[:limit],
+        total=len(matches),
+        has_more=len(matches) > limit,
+    )
+
+
+def register_completions(mcp: MCPServer, toolbox: Toolbox) -> None:
+    @mcp.completion()
+    async def complete(
+        ref: ResourceTemplateReference | PromptReference,
+        argument: Any,
+        _context: Any,
+    ) -> Completion | None:
+        name = getattr(argument, "name", None)
+        value = str(getattr(argument, "value", "") or "")
+        notes = toolbox.note_index()
+        if isinstance(ref, PromptReference) and ref.name == "research" and name == "topic":
+            return _complete([item["title"] for item in notes], value)
+        if isinstance(ref, ResourceTemplateReference):
+            if ref.uri == "notes://{name}" and name == "name":
+                return _complete([item["name"] for item in notes], value)
+            if ref.uri == "workspace://file/{+path}" and name == "path":
+                paths = [str(entry["path"]) for entry in toolbox.workspace_index()]
+                return _complete(paths, value)
+        return None
 
 
 def register_prompts(mcp: MCPServer) -> None:

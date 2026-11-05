@@ -14,13 +14,15 @@ from rich.text import Text
 console = Console(highlight=False)
 
 
-def print_banner(*, model: str, transport: str, trace_dir: str) -> None:
+def print_banner(*, model: str, transport: str, trace_dir: str, session: str | None = None) -> None:
     table = Table.grid(padding=(0, 1))
     table.add_column(style="bold cyan", no_wrap=True)
     table.add_column()
     table.add_row("model", model)
     table.add_row("transport", transport)
     table.add_row("traces", trace_dir)
+    if session is not None:
+        table.add_row("session", session)
     console.print(Panel(table, title="ReAct + MCP", border_style="cyan"))
 
 
@@ -57,6 +59,27 @@ def print_observation(text: str, *, is_error: bool = False) -> None:
     console.print(Panel(Text(text), title=title, border_style=style))
 
 
+def print_progress(progress: float, total: float | None, message: str | None) -> None:
+    amount = f"{progress:g}/{total:g}" if total else f"{progress:g}"
+    suffix = f" {message}" if message else ""
+    console.print(Text(f"progress {amount}{suffix}", style="dim cyan"))
+
+
+def print_server_log(level: str, logger_name: str | None, data: Any) -> None:
+    styles = {
+        "debug": "dim",
+        "info": "cyan",
+        "warning": "yellow",
+        "error": "red",
+        "critical": "bold red",
+    }
+    label = f"server {level}"
+    if logger_name:
+        label += f" ({logger_name})"
+    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
+    console.print(Text(f"{label}: {payload}", style=styles.get(level, "dim")))
+
+
 def print_final(answer: str, *, steps: int) -> None:
     console.print(Panel(Text(answer), title=f"Final Answer ({steps} steps)", border_style="green"))
 
@@ -68,6 +91,53 @@ def print_metrics(metrics: dict[str, int | float]) -> None:
     for key, value in metrics.items():
         table.add_row(key, f"{value}")
     console.print(table)
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def print_history(turns: list[Any]) -> None:
+    if not turns:
+        console.print(Text("No conversation history.", style="dim"))
+        return
+    table = Table(title="Conversation history", border_style="cyan")
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("question")
+    table.add_column("answer")
+    for index, turn in enumerate(turns, start=1):
+        table.add_row(
+            str(index),
+            _truncate(turn.question, 80),
+            _truncate(turn.answer, 120),
+        )
+    console.print(table)
+
+
+def print_sessions(sessions: list[Any]) -> None:
+    if not sessions:
+        console.print(Text("No saved sessions.", style="dim"))
+        return
+    table = Table(title="Saved sessions", border_style="cyan")
+    table.add_column("name", style="bold cyan", no_wrap=True)
+    table.add_column("turns", justify="right")
+    table.add_column("updated")
+    for session in sessions:
+        table.add_row(
+            session.name,
+            str(session.turns),
+            session.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        )
+    console.print(table)
+
+
+def print_session_status(*, session: str | None, turns: int, trace: str | None = None) -> None:
+    label = f"session {session}" if session else "ephemeral (not saved)"
+    parts = [label, f"{turns} turn(s)"]
+    if trace:
+        parts.append(f"trace {trace}")
+    console.print(Text(" | ".join(parts), style="dim"))
 
 
 def print_tools(tools: list[Any]) -> None:

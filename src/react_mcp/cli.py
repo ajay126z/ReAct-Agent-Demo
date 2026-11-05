@@ -20,11 +20,13 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
+from mcp import types as mcp_types
 from rich.json import JSON
 from rich.text import Text
 
 from . import __version__
 from .agent.llm import LLMError, OllamaLLM
+from .agent.memory import ConversationMemory, ConversationTurn, SessionStore
 from .agent.react import ReActAgent
 from .config import Settings, load_settings
 from .mcp_client.base import MCPClientError, ToolSpec, content_blocks_to_text
@@ -36,7 +38,7 @@ from .observability.otel import configure_otel, shutdown_otel
 from .observability.tracer import Tracer
 from .server import run_server
 
-COMMANDS = ("serve", "tools", "call", "ask", "repl", "protocol-demo", "doctor")
+COMMANDS = ("serve", "tools", "call", "ask", "repl", "session", "protocol-demo", "doctor")
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +61,13 @@ def _common_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-url", help="Streamable HTTP MCP endpoint")
     parser.add_argument("--trace-dir", help="Directory for trace artifacts")
     parser.add_argument("--no-trace", action="store_true", help="Disable JSONL trace files")
+    parser.add_argument("--progress", action="store_true", help="Show MCP tool progress updates")
+    parser.add_argument("--server-logs", action="store_true", help="Show MCP server log messages")
+    parser.add_argument(
+        "--auto-approve-writes",
+        action="store_true",
+        help="Allow write_file without an interactive elicitation prompt",
+    )
     parser.add_argument("--quiet", action="store_true", help="Only print the final answer")
     parser.add_argument("--otel", choices=["none", "console", "otlp"], help="OTel exporter")
     parser.add_argument(
@@ -67,6 +76,22 @@ def _common_parser() -> argparse.ArgumentParser:
         help="Log verbosity",
     )
     return parser
+
+
+def _add_session_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-s",
+        "--session",
+        metavar="NAME",
+        help="Resume or create a named session under data/sessions/",
+    )
+    parser.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Resume the most recently updated session",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,8 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     ask = sub.add_parser("ask", parents=[common], help="Ask the ReAct agent one question")
     ask.add_argument("question", nargs="+")
+    _add_session_args(ask)
 
-    sub.add_parser("repl", parents=[common], help="Interactive agent session")
+    repl = sub.add_parser("repl", parents=[common], help="Interactive agent session")
+    _add_session_args(repl)
+
+    session = sub.add_parser("session", parents=[common], help="Manage saved sessions")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_sub.add_parser("list", parents=[common], help="List saved sessions")
+    delete = session_sub.add_parser("delete", parents=[common], help="Delete a saved session")
+    delete.add_argument("session_name", metavar="NAME")
 
     demo = sub.add_parser("protocol-demo", parents=[common], help="Show raw JSON-RPC MCP frames")
     demo.add_argument("--expression", default="(17 * 3) + 9")
@@ -115,6 +148,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         trace_dir=getattr(args, "trace_dir", None),
         otel=getattr(args, "otel", None),
         log_level=getattr(args, "log_level", None),
+        require_write_approval=False if getattr(args, "auto_approve_writes", False) else None,
     )
 
 
@@ -169,6 +203,94 @@ def _tracer_label(tracer: Tracer | None, settings: Settings) -> str:
     return str(tracer.run_dir) if tracer is not None else f"{settings.trace_dir} (disabled)"
 
 
+def _session_context(
+    args: argparse.Namespace, settings: Settings
+) -> tuple[str | None, SessionStore]:
+    store = SessionStore(settings.session_dir)
+    name = getattr(args, "session", None)
+    if getattr(args, "continue_session", False):
+        name = store.latest()
+        if name is None:
+            raise ValueError("No saved sessions found.")
+    if name:
+        name = store.validate_name(name)
+    return name, store
+
+
+def _load_memory(store: SessionStore, name: str | None, settings: Settings) -> ConversationMemory:
+    if name is None:
+        return ConversationMemory(max_turns=settings.memory_turns, max_chars=settings.memory_chars)
+    return store.load(name, max_turns=settings.memory_turns, max_chars=settings.memory_chars)
+
+
+def _record_turn(
+    store: SessionStore,
+    name: str | None,
+    memory: ConversationMemory,
+    *,
+    question: str,
+    answer: str,
+    settings: Settings,
+) -> ConversationTurn:
+    turn = ConversationTurn.create(question, answer, model=settings.model)
+    if name is not None:
+        store.append(name, turn)
+    memory.add(turn)
+    return turn
+
+
+def _configure_readline() -> None:
+    try:
+        import readline
+    except ImportError:
+        return
+    readline.set_history_length(1000)
+
+
+async def _progress_callback(progress: float, total: float | None, message: str | None) -> None:
+    render.print_progress(progress, total, message)
+
+
+async def _logging_callback(params: Any) -> None:
+    render.print_server_log(
+        level=str(getattr(params, "level", "info")),
+        logger_name=getattr(params, "logger", None),
+        data=getattr(params, "data", None),
+    )
+
+
+async def _elicitation_callback(context: Any, params: Any) -> Any:
+    message = str(getattr(params, "message", "Approve this tool action?"))
+    render.print_text("Write approval", message)
+    try:
+        answer = await asyncio.to_thread(input, "Allow write? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return mcp_types.ElicitResult(action="cancel")
+    if answer.strip().lower() not in {"y", "yes"}:
+        return mcp_types.ElicitResult(action="decline")
+    return mcp_types.ElicitResult(action="accept", content={"approve": True})
+
+
+def _client_callbacks(
+    args: argparse.Namespace,
+    settings: Settings,
+    *,
+    allow_elicitation: bool = True,
+) -> dict[str, Any]:
+    server_logs = getattr(args, "server_logs", False)
+    return {
+        "logging_callback": _logging_callback if server_logs else None,
+        "log_level": "info" if server_logs else None,
+        "elicitation_callback": (
+            _elicitation_callback if allow_elicitation and settings.require_write_approval else None
+        ),
+    }
+
+
+def _progress_handler(args: argparse.Namespace) -> Any:
+    return _progress_callback if getattr(args, "progress", False) else None
+
+
 def _raw_tool_specs(result: dict[str, Any]) -> list[ToolSpec]:
     return [
         ToolSpec(
@@ -198,7 +320,11 @@ def _prompt_text(result: dict[str, Any]) -> str:
 async def _cmd_tools(args: argparse.Namespace, settings: Settings) -> int:
     tracer = _make_tracer(settings, enabled=not args.no_trace, run_name="tools")
     try:
-        async with SDKMCPClient(settings, tracer=tracer) as client:
+        async with SDKMCPClient(
+            settings,
+            tracer=tracer,
+            **_client_callbacks(args, settings, allow_elicitation=False),
+        ) as client:
             tools = await client.list_tools()
             resources = await client.list_resources()
             prompts = await client.list_prompts()
@@ -235,8 +361,12 @@ async def _cmd_call(args: argparse.Namespace, settings: Settings) -> int:
     )
     exit_code = 0
     try:
-        async with SDKMCPClient(settings, tracer=tracer) as client:
-            result = await client.call_tool(args.tool, arguments)
+        async with SDKMCPClient(
+            settings, tracer=tracer, **_client_callbacks(args, settings)
+        ) as client:
+            result = await client.call_tool(
+                args.tool, arguments, progress_callback=_progress_handler(args)
+            )
         if result.structured is not None:
             payload = json.dumps(result.structured, ensure_ascii=False, default=str)
             render.console.print(JSON(payload))
@@ -250,11 +380,16 @@ async def _cmd_call(args: argparse.Namespace, settings: Settings) -> int:
 
 async def _cmd_ask(args: argparse.Namespace, settings: Settings) -> int:
     question = " ".join(args.question).strip()
+    session_name, store = _session_context(args, settings)
+    memory = _load_memory(store, session_name, settings)
+    metadata: dict[str, Any] = {"question": question}
+    if session_name is not None:
+        metadata["session"] = session_name
     tracer = _make_tracer(
         settings,
         enabled=not args.no_trace,
         run_name="ask",
-        metadata={"question": question},
+        metadata=metadata,
     )
     metrics: dict[str, Any] = {}
     try:
@@ -263,8 +398,11 @@ async def _cmd_ask(args: argparse.Namespace, settings: Settings) -> int:
                 model=settings.model,
                 transport=settings.transport,
                 trace_dir=_tracer_label(tracer, settings),
+                session=session_name,
             )
-        async with SDKMCPClient(settings, tracer=tracer) as client:
+        async with SDKMCPClient(
+            settings, tracer=tracer, **_client_callbacks(args, settings)
+        ) as client:
             tools = await client.list_tools()
             if not tools:
                 raise RuntimeError("The MCP server exposed no tools.")
@@ -276,18 +414,36 @@ async def _cmd_ask(args: argparse.Namespace, settings: Settings) -> int:
                 settings=settings,
                 tracer=tracer,
                 show_steps=not args.quiet,
+                progress_callback=_progress_handler(args),
             )
-            result = await agent.run(question)
+            result = await agent.run(question, history=memory.turns)
         metrics = result.metrics.as_dict()
+        _record_turn(
+            store,
+            session_name,
+            memory,
+            question=question,
+            answer=result.answer,
+            settings=settings,
+        )
         if args.quiet:
             render.console.print(Text(result.answer))
+        elif session_name is not None:
+            render.print_session_status(
+                session=session_name,
+                turns=len(memory),
+                trace=str(tracer.run_dir) if tracer is not None else None,
+            )
         return 0
     finally:
         _close_tracer(tracer, metrics, quiet=args.quiet)
 
 
 async def _cmd_repl(args: argparse.Namespace, settings: Settings) -> int:
-    tracer = _make_tracer(settings, enabled=not args.no_trace, run_name="repl")
+    session_name, store = _session_context(args, settings)
+    memory = _load_memory(store, session_name, settings)
+    metadata: dict[str, Any] = {"session": session_name} if session_name else {}
+    tracer = _make_tracer(settings, enabled=not args.no_trace, run_name="repl", metadata=metadata)
     metrics: dict[str, Any] = {}
     try:
         if not args.quiet:
@@ -295,8 +451,11 @@ async def _cmd_repl(args: argparse.Namespace, settings: Settings) -> int:
                 model=settings.model,
                 transport=settings.transport,
                 trace_dir=_tracer_label(tracer, settings),
+                session=session_name,
             )
-        async with SDKMCPClient(settings, tracer=tracer) as client:
+        async with SDKMCPClient(
+            settings, tracer=tracer, **_client_callbacks(args, settings)
+        ) as client:
             tools = await client.list_tools()
             if not tools:
                 raise RuntimeError("The MCP server exposed no tools.")
@@ -308,11 +467,14 @@ async def _cmd_repl(args: argparse.Namespace, settings: Settings) -> int:
                 settings=settings,
                 tracer=tracer,
                 show_steps=not args.quiet,
+                progress_callback=_progress_handler(args),
             )
             render.print_tools(tools)
             render.print_protocol_note(
-                "Commands: :tools  :help  :clear  :exit  (Ctrl-D or Ctrl-C also exits)"
+                "Commands: :history  :reset  :metrics  :trace  :model  :tools  "
+                ":help  :clear  :exit  (Ctrl-D or Ctrl-C also exits)"
             )
+            _configure_readline()
             while True:
                 try:
                     question = await asyncio.to_thread(input, "\nyou> ")
@@ -331,16 +493,86 @@ async def _cmd_repl(args: argparse.Namespace, settings: Settings) -> int:
                     render.print_tools(tools)
                     continue
                 if lowered == ":help":
-                    render.print_protocol_note("Type a question, or :tools, :clear, :exit.")
+                    render.print_protocol_note(
+                        "Type a question, or :history, :reset, :metrics, :trace, "
+                        ":model, :tools, :clear, :exit."
+                    )
                     continue
                 if lowered == ":clear":
                     render.console.clear()
                     continue
-                result = await agent.run(question)
+                if lowered == ":history":
+                    render.print_history(memory.turns)
+                    continue
+                if lowered == ":reset":
+                    archived = store.reset(session_name) if session_name else None
+                    memory.clear()
+                    if archived is not None:
+                        render.print_protocol_note(
+                            f"Archived {session_name} to {archived}. Starting fresh."
+                        )
+                    elif session_name is not None:
+                        render.print_protocol_note(
+                            f"Session {session_name} had no saved turns. Starting fresh."
+                        )
+                    else:
+                        render.print_protocol_note("Conversation history cleared.")
+                    continue
+                if lowered == ":metrics":
+                    if metrics:
+                        render.print_metrics(metrics)
+                    else:
+                        render.print_protocol_note("No completed run yet.")
+                    continue
+                if lowered == ":trace":
+                    if tracer is not None:
+                        render.print_text("trace", str(tracer.run_dir))
+                    else:
+                        render.print_protocol_note("Tracing is disabled.")
+                    continue
+                if lowered == ":model":
+                    render.print_text("model", settings.model)
+                    continue
+                result = await agent.run(question, history=memory.turns)
                 metrics = result.metrics.as_dict()
+                _record_turn(
+                    store,
+                    session_name,
+                    memory,
+                    question=question,
+                    answer=result.answer,
+                    settings=settings,
+                )
+                if not args.quiet:
+                    render.print_session_status(
+                        session=session_name,
+                        turns=len(memory),
+                        trace=str(tracer.run_dir) if tracer is not None else None,
+                    )
         return 0
     finally:
         _close_tracer(tracer, metrics, quiet=args.quiet)
+
+
+async def _cmd_session(args: argparse.Namespace, settings: Settings) -> int:
+    store = SessionStore(settings.session_dir)
+    if args.session_command == "list":
+        sessions = store.list_sessions()
+        if args.quiet:
+            for session in sessions:
+                render.console.print(session.name)
+        else:
+            render.print_sessions(sessions)
+        return 0
+    if args.session_command == "delete":
+        if not store.delete(args.session_name):
+            raise ValueError(f"No session named {args.session_name!r}.")
+        if args.quiet:
+            render.console.print(args.session_name)
+        else:
+            render.print_protocol_note(f"Deleted session {args.session_name}.")
+        return 0
+    raise ValueError(f"Unknown session command: {args.session_command!r}")
 
 
 async def _cmd_protocol_demo(args: argparse.Namespace, settings: Settings) -> int:
@@ -447,6 +679,8 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         return await _cmd_ask(args, settings)
     if args.command == "repl":
         return await _cmd_repl(args, settings)
+    if args.command == "session":
+        return await _cmd_session(args, settings)
     if args.command == "protocol-demo":
         return await _cmd_protocol_demo(args, settings)
     if args.command == "doctor":

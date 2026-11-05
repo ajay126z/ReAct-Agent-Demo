@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import Settings
-from ..mcp_client.base import MCPToolClient, ToolSpec
+from ..mcp_client.base import MCPToolClient, ProgressCallback, ToolSpec
 from ..observability.logging import get_logger
 from ..observability.metrics import RunMetrics
 from ..observability.tracer import Span, Tracer
 from .llm import OllamaLLM
+from .memory import ConversationTurn
 from .parser import ParseResult, parse_react_output
 from .prompts import FORCE_FINAL_PROMPT, PARSE_RETRY_TEMPLATE, build_system_prompt
 
@@ -42,6 +43,7 @@ class ReActAgent:
         settings: Settings,
         tracer: Tracer | None = None,
         show_steps: bool = True,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         self.llm = llm
         self.client = client
@@ -50,6 +52,7 @@ class ReActAgent:
         self.settings = settings
         self.tracer = tracer
         self.show_steps = show_steps
+        self.progress_callback = progress_callback
 
     @contextmanager
     def _span(self, name: str, **attributes: Any) -> Iterator[Span | None]:
@@ -60,13 +63,18 @@ class ReActAgent:
             with self.tracer.span(name, **attributes) as span:
                 yield span
 
-    async def run(self, question: str) -> AgentResult:
+    async def run(
+        self, question: str, history: Sequence[ConversationTurn] | None = None
+    ) -> AgentResult:
         metrics = RunMetrics()
         transcript: list[dict[str, Any]] = []
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": build_system_prompt(self.tools)},
-            {"role": "user", "content": question},
+            {"role": "system", "content": build_system_prompt(self.tools)}
         ]
+        for turn in history or ():
+            messages.append({"role": "user", "content": turn.question})
+            messages.append({"role": "assistant", "content": f"Final Answer: {turn.answer}"})
+        messages.append({"role": "user", "content": question})
 
         answer = ""
         stopped_reason = "max_steps"
@@ -83,6 +91,7 @@ class ReActAgent:
             question=question,
             model=self.settings.model,
             max_steps=self.settings.max_steps,
+            history_turns=len(history or ()),
         ) as run_span:
             for step in range(1, self.settings.max_steps + 1):
                 metrics.steps = step
@@ -239,7 +248,11 @@ class ReActAgent:
 
         started = time.perf_counter()
         try:
-            result = await self.client.call_tool(action, arguments or {})
+            result = await self.client.call_tool(
+                action,
+                arguments or {},
+                progress_callback=self.progress_callback,
+            )
         except Exception as exc:
             duration_ms = (time.perf_counter() - started) * 1000
             metrics.record_tool(duration_ms=duration_ms, is_error=True)
