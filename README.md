@@ -59,20 +59,20 @@ default; use `--auto-approve-writes` for non-interactive runs.
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `react-mcp doctor` | Check Python, Ollama, the model, and the MCP server. |
-| `react-mcp tools` | Connect over MCP and list tools, resources, and prompts. |
-| `react-mcp call <tool> --args '<json>'` | Call one tool directly, without the LLM. |
-| `react-mcp ask "<question>"` | Run the ReAct agent once. |
-| `react-mcp repl` | Interactive agent session. |
-| `react-mcp repl --session NAME` | Resume or create a saved session. |
-| `react-mcp repl --continue` | Resume the most recently updated session. |
-| `react-mcp session list` | List saved sessions, turn counts, and update times. |
-| `react-mcp session delete NAME` | Delete a saved session. |
-| `react-mcp protocol-demo` | Print the raw JSON-RPC frames of a full MCP session. |
-| `react-mcp serve` | Run the MCP server over stdio. |
-| `react-mcp serve --http --port 8000` | Run it over Streamable HTTP. |
+| Command                                 | What it does                                             |
+| --------------------------------------- | -------------------------------------------------------- |
+| `react-mcp doctor`                      | Check Python, Ollama, the model, and the MCP server.     |
+| `react-mcp tools`                       | Connect over MCP and list tools, resources, and prompts. |
+| `react-mcp call <tool> --args '<json>'` | Call one tool directly, without the LLM.                 |
+| `react-mcp ask "<question>"`            | Run the ReAct agent once.                                |
+| `react-mcp repl`                        | Interactive agent session.                               |
+| `react-mcp repl --session NAME`         | Resume or create a saved session.                        |
+| `react-mcp repl --continue`             | Resume the most recently updated session.                |
+| `react-mcp session list`                | List saved sessions, turn counts, and update times.      |
+| `react-mcp session delete NAME`         | Delete a saved session.                                  |
+| `react-mcp protocol-demo`               | Print the raw JSON-RPC frames of a full MCP session.     |
+| `react-mcp serve`                       | Run the MCP server over stdio.                           |
+| `react-mcp serve --http --port 8000`    | Run it over Streamable HTTP.                             |
 
 Common flags go after the subcommand:
 
@@ -109,17 +109,17 @@ not intermediate ReAct observations. Follow-up prompts receive the last six
 turns, capped at 4000 characters total (`REACT_MCP_MEMORY_TURNS` and
 `REACT_MCP_MEMORY_CHARS`). REPL commands:
 
-| Command | What it does |
-| --- | --- |
+| Command    | What it does                                   |
+| ---------- | ---------------------------------------------- |
 | `:history` | Show the current bounded conversation history. |
-| `:reset` | Archive the session JSONL and start fresh. |
-| `:metrics` | Show metrics from the last completed run. |
-| `:trace` | Show the current trace directory. |
-| `:model` | Show the active Ollama model. |
-| `:tools` | List MCP tools again. |
-| `:help` | Show available commands. |
-| `:clear` | Clear the terminal. |
-| `:exit` | Leave the REPL. |
+| `:reset`   | Archive the session JSONL and start fresh.     |
+| `:metrics` | Show metrics from the last completed run.      |
+| `:trace`   | Show the current trace directory.              |
+| `:model`   | Show the active Ollama model.                  |
+| `:tools`   | List MCP tools again.                          |
+| `:help`    | Show available commands.                       |
+| `:clear`   | Clear the terminal.                            |
+| `:exit`    | Leave the REPL.                                |
 
 ```bash
 uv run react-mcp repl --session research
@@ -208,13 +208,13 @@ Python.
 
 Each run writes a folder under `traces/<timestamp>-<run-id>/`:
 
-| File | Contents |
-| --- | --- |
-| `run.json` | Run id, start time, environment metadata. |
-| `spans.jsonl` | One JSON object per span (nested, with durations). |
-| `events.jsonl` | Standalone timestamped events. |
-| `protocol.jsonl` | Raw MCP frames (protocol demo / raw client). |
-| `summary.json` | Span counts, metrics, artifact paths. |
+| File             | Contents                                           |
+| ---------------- | -------------------------------------------------- |
+| `run.json`       | Run id, start time, environment metadata.          |
+| `spans.jsonl`    | One JSON object per span (nested, with durations). |
+| `events.jsonl`   | Standalone timestamped events.                     |
+| `protocol.jsonl` | Raw MCP frames (protocol demo / raw client).       |
+| `summary.json`   | Span counts, metrics, artifact paths.              |
 
 Typical spans: `agent.run` > `agent.step` > `llm.chat` and `mcp.tools/call`.
 Metrics include steps, LLM calls, prompt/completion tokens, tool calls, tool
@@ -231,33 +231,33 @@ jq -c '{name, ms:.duration_ms, status}' traces/*/spans.jsonl
 Settings come from environment variables with the `REACT_MCP_` prefix, loaded
 from `.env` when present. CLI flags override them.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `REACT_MCP_MODEL` | `qwen3.5:9b` | Ollama model. |
-| `REACT_MCP_OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint. |
-| `REACT_MCP_TEMPERATURE` | `0.1` | Sampling temperature. |
-| `REACT_MCP_NUM_CTX` | `8192` | Context window. |
-| `REACT_MCP_KEEP_ALIVE` | `10m` | Ollama model keep-alive duration. |
-| `REACT_MCP_THINK` | `false` | Enable thinking-channel output. |
-| `REACT_MCP_REQUEST_TIMEOUT` | `180` | MCP request timeout in seconds. |
-| `REACT_MCP_MAX_STEPS` | `8` | Maximum ReAct iterations. |
-| `REACT_MCP_MAX_PARSE_RETRIES` | `2` | Format-correction retries. |
-| `REACT_MCP_MAX_OBSERVATION_CHARS` | `2000` | Observation truncation. |
-| `REACT_MCP_MEMORY_TURNS` | `6` | Prior Q/A turns injected into follow-ups. |
-| `REACT_MCP_MEMORY_CHARS` | `4000` | Total character budget for prior Q/A. |
-| `REACT_MCP_REQUIRE_WRITE_APPROVAL` | `true` | Require MCP elicitation before `write_file`. |
-| `REACT_MCP_TRANSPORT` | `stdio` | `stdio` or `http`. |
-| `REACT_MCP_SERVER_URL` | `http://127.0.0.1:8000/mcp` | HTTP endpoint. |
-| `REACT_MCP_WEB_FETCH_ENABLED` | `true` | Enable `web_fetch` / `web_search`. |
-| `REACT_MCP_WEB_FETCH_TIMEOUT` | `15` | Per-request web timeout (seconds). |
-| `REACT_MCP_WEB_FETCH_MAX_BYTES` | `500000` | Max bytes read per web response. |
-| `REACT_MCP_WEB_FETCH_MAX_CHARS` | `20000` | Max chars returned by `web_fetch`. |
-| `REACT_MCP_WEB_SEARCH_LIMIT` | `10` | Default cap for `web_search` limit. |
-| `REACT_MCP_SESSION_DIR` | `./data/sessions` | Saved REPL session directory. |
-| `REACT_MCP_TRACE_DIR` | `./traces` | Trace output directory. |
-| `REACT_MCP_LOG_LEVEL` | `INFO` | Log verbosity. |
-| `REACT_MCP_OTEL` | `none` | `none`, `console`, or `otlp`. |
-| `REACT_MCP_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP collector. |
+| Variable                           | Default                     | Purpose                                      |
+| ---------------------------------- | --------------------------- | -------------------------------------------- |
+| `REACT_MCP_MODEL`                  | `qwen3.5:9b`                | Ollama model.                                |
+| `REACT_MCP_OLLAMA_HOST`            | `http://localhost:11434`    | Ollama endpoint.                             |
+| `REACT_MCP_TEMPERATURE`            | `0.1`                       | Sampling temperature.                        |
+| `REACT_MCP_NUM_CTX`                | `8192`                      | Context window.                              |
+| `REACT_MCP_KEEP_ALIVE`             | `10m`                       | Ollama model keep-alive duration.            |
+| `REACT_MCP_THINK`                  | `false`                     | Enable thinking-channel output.              |
+| `REACT_MCP_REQUEST_TIMEOUT`        | `180`                       | MCP request timeout in seconds.              |
+| `REACT_MCP_MAX_STEPS`              | `8`                         | Maximum ReAct iterations.                    |
+| `REACT_MCP_MAX_PARSE_RETRIES`      | `2`                         | Format-correction retries.                   |
+| `REACT_MCP_MAX_OBSERVATION_CHARS`  | `2000`                      | Observation truncation.                      |
+| `REACT_MCP_MEMORY_TURNS`           | `6`                         | Prior Q/A turns injected into follow-ups.    |
+| `REACT_MCP_MEMORY_CHARS`           | `4000`                      | Total character budget for prior Q/A.        |
+| `REACT_MCP_REQUIRE_WRITE_APPROVAL` | `true`                      | Require MCP elicitation before `write_file`. |
+| `REACT_MCP_TRANSPORT`              | `stdio`                     | `stdio` or `http`.                           |
+| `REACT_MCP_SERVER_URL`             | `http://127.0.0.1:8000/mcp` | HTTP endpoint.                               |
+| `REACT_MCP_WEB_FETCH_ENABLED`      | `true`                      | Enable `web_fetch` / `web_search`.           |
+| `REACT_MCP_WEB_FETCH_TIMEOUT`      | `15`                        | Per-request web timeout (seconds).           |
+| `REACT_MCP_WEB_FETCH_MAX_BYTES`    | `500000`                    | Max bytes read per web response.             |
+| `REACT_MCP_WEB_FETCH_MAX_CHARS`    | `20000`                     | Max chars returned by `web_fetch`.           |
+| `REACT_MCP_WEB_SEARCH_LIMIT`       | `10`                        | Default cap for `web_search` limit.          |
+| `REACT_MCP_SESSION_DIR`            | `./data/sessions`           | Saved REPL session directory.                |
+| `REACT_MCP_TRACE_DIR`              | `./traces`                  | Trace output directory.                      |
+| `REACT_MCP_LOG_LEVEL`              | `INFO`                      | Log verbosity.                               |
+| `REACT_MCP_OTEL`                   | `none`                      | `none`, `console`, or `otlp`.                |
+| `REACT_MCP_OTLP_ENDPOINT`          | `http://localhost:4317`     | OTLP collector.                              |
 
 Path settings (`REACT_MCP_WORKSPACE_DIR`, `REACT_MCP_NOTES_DIR`,
 `REACT_MCP_SESSION_DIR`) are available too; see `.env.example`.
