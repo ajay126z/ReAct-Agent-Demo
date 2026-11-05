@@ -2,11 +2,13 @@
 
 Common questions about this project — the ReAct agent, MCP, tools, and the free OpenCode-style web tools. Written for learners of ReAct architecture and its implementation.
 
+> **Links:** all source-code links below are **relative** (`../src/...`), so they work both on GitHub and via Command/Ctrl-click in Zed (local file). Absolute `https://github.com/...` links would instead open the browser in Zed.
+
 ## ReAct agent
 
 **Q: How is the “Reason → Act → Observe” cycle implemented? What is the iteration limit?**
 
-A: The loop lives in `src/react_mcp/agent/react.py:ReActAgent.run()`. Each iteration is: (1) Reasoning — `await llm.chat(messages, stop=["Observation:"])` produces text parsed by `parser.parse_react_output()` into `final | action | invalid`; (2) Acting — `_execute_action()` validates `Action:` against the known tool map and calls `await client.call_tool(action, args)` over MCP; (3) Observing — the result is truncated to `REACT_MCP_MAX_OBSERVATION_CHARS` (default `2000`) and appended as `user: "Observation: <result>"`, then the loop repeats.
+A: The loop lives in [src/react_mcp/agent/react.py:ReActAgent.run()](../src/react_mcp/agent/react.py#L66). Each iteration is: (1) Reasoning — `await llm.chat(messages, stop=["Observation:"])` produces text parsed by `parser.parse_react_output()` into `final | action | invalid`; (2) Acting — `_execute_action()` validates `Action:` against the known tool map and calls `await client.call_tool(action, args)` over MCP; (3) Observing — the result is truncated to `REACT_MCP_MAX_OBSERVATION_CHARS` (default `2000`) and appended as `user: "Observation: <result>"`, then the loop repeats.
 
 The iteration limit is `Settings.max_steps` (`REACT_MCP_MAX_STEPS`), **default `8`, range `1–50`** — settable via `.env` or `--max-steps`. The loop is `for step in range(1, max_steps + 1)`.
 
@@ -14,11 +16,11 @@ There is no `max_parse_retries` per query in the strict sense, but each invalid 
 
 **Q: Why text-based ReAct instead of native tool calling?**
 
-A: So the agent's reasoning and every action are visible in the transcript and trace — you can see `Thought`, `Action`, `Action Input`, and `Observation` as plain text (see `README.md: How it works`). It also works uniformly with local Ollama models that may not support native tool schemas. The trade-off is a forgiving parser: `src/react_mcp/agent/parser.py` strips markdown fences, tolerates prose around JSON, and accepts Python-style single quotes via `ast.literal_eval`.
+A: So the agent's reasoning and every action are visible in the transcript and trace — you can see `Thought`, `Action`, `Action Input`, and `Observation` as plain text (see [README.md: How it works](../README.md)). It also works uniformly with local Ollama models that may not support native tool schemas. The trade-off is a forgiving parser: [src/react_mcp/agent/parser.py](../src/react_mcp/agent/parser.py) strips markdown fences, tolerates prose around JSON, and accepts Python-style single quotes via `ast.literal_eval`.
 
 **Q: How does the agent avoid inventing a tool result?**
 
-A: Three guards: (1) the LLM call uses `stop=["Observation:"]` so the model must stop before fabricating output; (2) the system prompt (`src/react_mcp/agent/prompts.py:SYSTEM_TEMPLATE`) forbids writing `Observation:` and limits the model to one `Action:` per turn using only listed tool names; (3) every observation comes from a real `tools/call` over MCP, never from the model itself.
+A: Three guards: (1) the LLM call uses `stop=["Observation:"]` so the model must stop before fabricating output; (2) the system prompt ([src/react_mcp/agent/prompts.py:SYSTEM_TEMPLATE](../src/react_mcp/agent/prompts.py#L9)) forbids writing `Observation:` and limits the model to one `Action:` per turn using only listed tool names; (3) every observation comes from a real `tools/call` over MCP, never from the model itself.
 
 **Q: How does the agent learn its tools?**
 
@@ -30,7 +32,7 @@ A: `parse_react_output()` returns `kind="final"`; the loop breaks with `stopped_
 
 **Q: What is bounded Q/A memory in REPL/ASK sessions?**
 
-A: `ConversationMemory` injects only the last `REACT_MCP_MEMORY_TURNS` (default `6`) completed Q/A turns, capped at `REACT_MCP_MEMORY_CHARS` (default `4000`) total characters. Intermediate ReAct observations are *not* stored — see `src/react_mcp/agent/memory.py` and sessions in `data/sessions/*.jsonl`.
+A: `ConversationMemory` injects only the last `REACT_MCP_MEMORY_TURNS` (default `6`) completed Q/A turns, capped at `REACT_MCP_MEMORY_CHARS` (default `4000`) total characters. Intermediate ReAct observations are *not* stored — see [src/react_mcp/agent/memory.py](../src/react_mcp/agent/memory.py#L64) and sessions in `data/sessions/*.jsonl`.
 
 **Q: How are errors and parse failures handled?**
 
@@ -40,15 +42,15 @@ A: Unknown tool names and bad argument shapes become `is_error` observations (`"
 
 **Q: What is MCP in this project, in one diagram?**
 
-A: A local MCP server (`python -m react_mcp.server` over stdio, or Streamable HTTP) exposes **tools** + **resources** + **prompts**; the ReAct agent talks to it via an MCP client (`SDKMCPClient` official SDK, or `RawMCPClient` handwritten JSON-RPC). The cycle is: `initialize` → `tools/list` (discovery) → `tools/call` (execution) → observations fed back to the LLM. See the sequence diagram in `docs/mcp-protocol.md` and `uv run react-mcp protocol-demo`.
+A: A local MCP server (`python -m react_mcp.server` over stdio, or Streamable HTTP) exposes **tools** + **resources** + **prompts**; the ReAct agent talks to it via an MCP client (`SDKMCPClient` official SDK, or `RawMCPClient` handwritten JSON-RPC). The cycle is: `initialize` → `tools/list` (discovery) → `tools/call` (execution) → observations fed back to the LLM. See the sequence diagram in [docs/mcp-protocol.md](mcp-protocol.md) and `uv run react-mcp protocol-demo`.
 
 **Q: What is the difference between stdio and HTTP transports?**
 
-A: `stdio` (default) — the client spawns the server as a subprocess and exchanges newline-delimited JSON-RPC on stdin/stdout. Simple, local, no network surface. `http` — `react-mcp serve --http --port 8000` plus `--transport http --server-url http://127.0.0.1:8000/mcp`; useful for the MCP Inspector (`uv run mcp dev src/react_mcp/server.py`) and remote clients. `serve` over HTTP binds loopback by default with no auth — do not expose publicly without adding auth/TLS (see `README.md` Safety).
+A: `stdio` (default) — the client spawns the server as a subprocess and exchanges newline-delimited JSON-RPC on stdin/stdout. Simple, local, no network surface. `http` — `react-mcp serve --http --port 8000` plus `--transport http --server-url http://127.0.0.1:8000/mcp`; useful for the MCP Inspector (`uv run mcp dev src/react_mcp/server.py`) and remote clients. `serve` over HTTP binds loopback by default with no auth — do not expose publicly without adding auth/TLS (see [README.md: Safety](../README.md)).
 
 **Q: What are tools, resources, prompts, and completions?**
 
-A: All four are MCP capability types: **tools** (callable functions like `calculator`, `web_fetch`); **resources** (readable URIs like `notes://index`, `config://agent`, `workspace://file/{path}`); **prompts** (reusable templates like `research(topic)`, `explain_mcp()`); **completions** (autocomplete for note names, workspace paths, prompt topics, `src/react_mcp/tools.py:register_completions`).
+A: All four are MCP capability types: **tools** (callable functions like `calculator`, `web_fetch`); **resources** (readable URIs like `notes://index`, `config://agent`, `workspace://file/{path}`); **prompts** (reusable templates like `research(topic)`, `explain_mcp()`); **completions** (autocomplete for note names, workspace paths, prompt topics, [src/react_mcp/tools.py:register_completions](../src/react_mcp/tools.py#L1503)).
 
 **Q: Why does `write_file` use elicitation? What is elicitation?**
 
@@ -56,7 +58,7 @@ A: MCP elicitation is server-initiated approval: for `write_file` the server cal
 
 **Q: What is the legacy handshake fallback about?**
 
-A: The official SDK client defaults to protocol `2026-07-28`, but if an elicitation callback is registered it falls back to legacy `initialize` (`2025-11-25`) so server→client requests remain legal. The educational raw client in `scripts/demo_protocol.py` always uses the legacy handshake to match common MCP material. See `README.md: How it works`.
+A: The official SDK client defaults to protocol `2026-07-28`, but if an elicitation callback is registered it falls back to legacy `initialize` (`2025-11-25`) so server→client requests remain legal. The educational raw client in [scripts/demo_protocol.py](../scripts/demo_protocol.py) always uses the legacy handshake to match common MCP material. See [README.md: How it works](../README.md).
 
 **Q: How do I inspect raw MCP frames?**
 
@@ -66,7 +68,7 @@ A: `uv run react-mcp protocol-demo` prints the `initialize` / `tools/list` / `to
 
 **Q: How is a new MCP tool added?**
 
-A: Add a method to `Toolbox` in `src/react_mcp/tools.py` (with `ToolError` for invalid input, size limits, and `_safe_path()` checks for filesystem tools), then register it in `register_tools()` with `@mcp.tool(title=..., annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))` and `@instrumented`. `@instrumented` is `functools.wraps`, preserving the original signature so the SDK derives the JSON schema. For progress/logging, make it `async def …(ctx: Context)` and call `ctx.report_progress` / `ctx.log`. Restart the client so it rediscovers tools.
+A: Add a method to `Toolbox` in [src/react_mcp/tools.py](../src/react_mcp/tools.py#L1140) (with `ToolError` for invalid input, size limits, and `_safe_path()` checks for filesystem tools), then register it in `register_tools()` with `@mcp.tool(title=..., annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))` and `@instrumented`. `@instrumented` is `functools.wraps`, preserving the original signature so the SDK derives the JSON schema. For progress/logging, make it `async def …(ctx: Context)` and call `ctx.report_progress` / `ctx.log`. Restart the client so it rediscovers tools.
 
 **Q: Why `ToolAnnotations` (`read_only_hint`, `open_world_hint`, …)?**
 
@@ -90,7 +92,7 @@ This exercises the exact `tools/call` path the agent uses, minus the model.
 
 **Q: Where should I look to understand a tool end-to-end?**
 
-A: `Toolbox.<name>()` (logic) → `register_tools()` wrapper (schema + `@instrumented` + `Context` progress) → `server.py:INSTRUCTIONS` (advertised behaviour) → `tests/test_*.py` (behaviour contract). The trace dir (`traces/<run>/spans.jsonl`) shows `agent.step > llm.chat` and `mcp.tools/call` spans with durations and metrics.
+A: `Toolbox.<name>()` (logic) → `register_tools()` wrapper (schema + `@instrumented` + `Context` progress) → [server.py:INSTRUCTIONS](../src/react_mcp/server.py#L33) (advertised behaviour) → `tests/test_*.py` (behaviour contract). The trace dir (`traces/<run>/spans.jsonl`) shows `agent.step > llm.chat` and `mcp.tools/call` spans with durations and metrics.
 
 ## Web tools (`web_fetch` / `web_search`)
 
@@ -116,7 +118,7 @@ A: Before every request — and again on every redirect hop — the URL is valid
 
 **Q: What are the size/timeout limits?**
 
-A: Configurable in `config.py`: `REACT_MCP_WEB_FETCH_TIMEOUT` (default 15s), `REACT_MCP_WEB_FETCH_MAX_BYTES` (default 500000), `REACT_MCP_WEB_FETCH_MAX_CHARS` (default 20000). The agent's `REACT_MCP_MAX_OBSERVATION_CHARS` (default 2000) still truncates what the model sees per turn.
+A: Configurable in [config.py](../src/react_mcp/config.py): `REACT_MCP_WEB_FETCH_TIMEOUT` (default 15s), `REACT_MCP_WEB_FETCH_MAX_BYTES` (default 500000), `REACT_MCP_WEB_FETCH_MAX_CHARS` (default 20000). The agent's `REACT_MCP_MAX_OBSERVATION_CHARS` (default 2000) still truncates what the model sees per turn.
 
 **Q: Is fetched content trusted?**
 
@@ -140,7 +142,7 @@ A: Both tools use only the Python standard library (`urllib`, `html.parser`, `ip
 
 **Q: Where are web tools implemented?**
 
-A: `Toolbox.web_fetch()` / `Toolbox.web_search()` in `src/react_mcp/tools.py`, registered in `register_tools()`, with settings in `src/react_mcp/config.py`. They follow the same `@instrumented` + `Context` progress/log pattern as `csv_preview` and `sqlite_query`.
+A: `Toolbox.web_fetch()` / `Toolbox.web_search()` in [src/react_mcp/tools.py](../src/react_mcp/tools.py), registered in `register_tools()`, with settings in [src/react_mcp/config.py](../src/react_mcp/config.py). They follow the same `@instrumented` + `Context` progress/log pattern as `csv_preview` and `sqlite_query`.
 
 **Q: Do I need to restart anything to see the new tools?**
 
